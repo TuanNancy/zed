@@ -4956,7 +4956,12 @@ impl Project {
         })
     }
 
-    fn search_impl(&mut self, query: SearchQuery, cx: &mut Context<Self>) -> SearchResultsHandle {
+    fn search_impl(
+        &mut self,
+        query: SearchQuery,
+        include_private_omissions: bool,
+        cx: &mut Context<Self>,
+    ) -> SearchResultsHandle {
         let client: Option<(AnyProtoClient, _)> = if let Some(ssh_client) = &self.remote_client {
             Some((ssh_client.read(cx).proto_client(), 0))
         } else if let Some(remote_id) = self.remote_id() {
@@ -4989,7 +4994,9 @@ impl Project {
                 ),
             }
         };
-        searcher.into_handle(query, cx)
+        searcher
+            .include_private_omissions(include_private_omissions)
+            .into_handle(query, cx)
     }
 
     pub fn search(
@@ -4997,7 +5004,17 @@ impl Project {
         query: SearchQuery,
         cx: &mut Context<Self>,
     ) -> SearchResults<SearchResult> {
-        self.search_impl(query, cx).results(cx)
+        self.search_impl(query, true, cx)
+            .without_omissions()
+            .results(cx)
+    }
+
+    pub fn search_with_omissions(
+        &mut self,
+        query: SearchQuery,
+        cx: &mut Context<Self>,
+    ) -> SearchResults<SearchResult> {
+        self.search_impl(query, true, cx).results(cx)
     }
 
     pub fn request_lsp<R: LspCommand>(
@@ -6235,8 +6252,21 @@ impl Project {
         let client = this.read_with(&cx, |this, _| this.client());
         let task = cx.spawn(async move |cx| {
             let results = this.update(cx, |this, cx| {
-                this.search_impl(query, cx).matching_buffers(cx)
+                this.search_impl(query, false, cx).matching_buffers(cx)
             });
+            let omissions_task = if message.report_omissions {
+                cx.background_spawn(project_search::forward_search_omissions(
+                    results.omissions,
+                    results.omissions_status,
+                    AnyProtoClient::from(client.clone()),
+                    project_id,
+                    peer_id,
+                    handle,
+                ))
+            } else {
+                drop(results.omissions);
+                Task::ready(Ok(0))
+            };
             let (batcher, batches) = project_search::AdaptiveBatcher::new(cx.background_executor());
             let mut new_matches = Box::pin(results.rx);
 
@@ -6255,6 +6285,7 @@ impl Project {
                                         proto::FindSearchCandidatesMatches { buffer_ids },
                                     ),
                                 ),
+                                ..proto::FindSearchCandidatesChunk::default()
                             })
                             .await?;
                     }
@@ -6277,18 +6308,26 @@ impl Project {
             }
             batcher.flush().await;
 
-            sender_task.await?;
+            let sender_result = sender_task.await;
+            let omissions_sequence = omissions_task.await.log_err();
 
-            let _ = client
+            let done_result = client
                 .request(proto::FindSearchCandidatesChunk {
                     handle,
                     peer_id: Some(peer_id),
                     project_id,
                     variant: Some(proto::find_search_candidates_chunk::Variant::Done(
-                        proto::FindSearchCandidatesDone {},
+                        proto::FindSearchCandidatesDone {
+                            omissions_failed: omissions_sequence.is_none(),
+                            matches_failed: sender_result.is_err(),
+                        },
                     )),
+                    omissions_sequence,
+                    ..proto::FindSearchCandidatesChunk::default()
                 })
-                .await?;
+                .await;
+            sender_result?;
+            done_result?;
             anyhow::Ok(())
         });
         buffer_store.update(&mut cx, |this, _| {
