@@ -103,10 +103,22 @@ impl TextDiffView {
         });
 
         let source_buffer_snapshot = source_buffer.read(cx).snapshot();
-        let mut clipboard_text = diff_data.clipboard_text.clone();
+        let selection_end_offset =
+            source_buffer_snapshot.point_to_offset(expanded_selection_range.end);
+        let selection_ends_with_newline = selection_end_offset > 0
+            && source_buffer_snapshot
+                .text()
+                .as_bytes()
+                .get(selection_end_offset - 1)
+                == Some(&b'\n');
 
-        if !clipboard_text.ends_with("\n") {
-            clipboard_text.push_str("\n");
+        let mut clipboard_text = diff_data.clipboard_text.clone();
+        if selection_ends_with_newline {
+            if !clipboard_text.ends_with('\n') {
+                clipboard_text.push('\n');
+            }
+        } else {
+            clipboard_text = clipboard_text.trim_end_matches('\n').to_owned();
         }
 
         let workspace = workspace.weak_handle();
@@ -550,6 +562,23 @@ mod tests {
             ),
             "Clipboard ↔ text.txt @ L1:1-3",
             &format!("Clipboard ↔ {} @ L1:1-3", path!("test/text.txt")),
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn test_diffing_clipboard_with_trailing_newline_against_last_line_without_one(
+        cx: &mut TestAppContext,
+    ) {
+        base_test(
+            path!("/test"),
+            path!("/test/text.txt"),
+            "hello\n",
+            "«helloˇ»",
+            "ˇhello",
+            "Clipboard ↔ text.txt @ L1:1-6",
+            &format!("Clipboard ↔ {} @ L1:1-6", path!("test/text.txt")),
             cx,
         )
         .await;
